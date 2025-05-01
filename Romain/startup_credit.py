@@ -12,7 +12,7 @@ from dataclasses import dataclass,field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Sequence,Iterable
-import matplotlib as plt
+import matplotlib.pyplot as plt
 import requests
 
 # --------------------------------------------------------------------------- #
@@ -35,9 +35,12 @@ from sklearn.calibration import IsotonicRegression, calibration_curve
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
+    confusion_matrix,
     classification_report,
     roc_auc_score,
     brier_score_loss,
+    roc_curve, 
+    precision_recall_curve
 )
 from sklearn.model_selection import (
     StratifiedKFold,
@@ -87,13 +90,6 @@ MACRO_DIR = Path(r"C:\Users\Romain\OneDrive - KU Leuven\Masters\MBIS\Year 2\Seme
 META_FILE = Path(__file__).with_name("country_meta.csv")
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
-WGI_INDICATORS: Dict[str, str] = {
-    "regulatory_quality": "RQ.EST",
-    "rule_of_law": "RL.EST",
-    "control_of_corruption": "CC.EST",
-}
-WGI_YEARS: List[int] = list(range(2020, 2024))  # 2020-2023 inclusive
-
 
 # --------------------------------------------------------------------------- #
 # External macro files (path, derive_growth)
@@ -119,7 +115,7 @@ class BusinessFrame:
     cost_fp: float = 1.0
 
     use_lgd: bool = False
-    rating_edges: Tuple[float, ...] | None = None  # length = len(labels)-1
+    rating_edges: Tuple[float, ...] | None = None 
 
     decision_matrix: Dict[str, Dict[str, Dict[str, Any]]] = field(
         default_factory=dict
@@ -143,19 +139,25 @@ DEFAULT_DEC_MATRIX: Dict[str, Dict[str, Dict[str, Any]]] = {
         ">=1M": {"action": "PRICE_UP", "spread_bps": 400},
     },
     "R4": {
-        "*": {"action": "DECLINE"},
+        "<1M": {"action": "DECLINE"},
+        ">=1M": {"action": "DECLINE"},
     },
     "R5": {
-        "*": {"action": "DECLINE"},
+        "<1M": {"action": "DECLINE"},
+        ">=1M": {"action": "DECLINE"},
     },
 }
 
 _DEFAULT_CFG = BusinessFrame(
-    horizon_months=24,
+    horizon_months=0,
     good_statuses=("operating", "operation", "acquired", "ipo"),
     bad_statuses=("closed",),
     pd_table={"R1": 0.02, "R2": 0.05, "R3": 0.12, "R4": 0.20, "R5": 0.35},
 )
+
+_DEFAULT_LGD_TABLE = {"R1": 0.20, "R2": 0.30, "R3": 0.40, "R4": 0.55, "R5": 0.65}
+_DEFAULT_RATIOS= {"base_rate":0.03,"cost_of_funds":0.01,"opex_ratio":0.005,"capital_charge":0.02}
+
 # ╭──────────────────────────── Helpers ─────────────────────────────────────╮
 MACRO_COLS = ["inflation", "gdp_growth", "unemployment_rate"]
 
@@ -168,6 +170,7 @@ NUM_WOE = [
 ]
 
 NUM_EXTRA = list({ 
+    "funding_per_year",
     "funding_per_round",
     "rounds_per_year",
     "months_since_last_round",
@@ -186,6 +189,7 @@ CAT_COLS = [
     "country_code",
     "primary_sector",
     "subregion", 
+    "currency"
 ]
 
 MOMENTUM_COLS = [
@@ -255,7 +259,6 @@ def optimise_edges(
 ) -> List[float]:
     """Return monotonic PD edges (R1–R5) minimising MAE to target PD table.
     """
-
     rng = np.random.default_rng(seed)
     tgt = np.array(list(pd_table.values()))
     q = np.percentile(pd_hat, np.linspace(5, 95, 51))
@@ -312,6 +315,19 @@ def optimise_threshold(
     thr_idx = np.argmin(cost)
     return float(pd_sorted[thr_idx])
 
+def risk_based_spread(pd_hat: float,
+                       rating: str,
+                       *,
+                       base_rate: float = 0.03,
+                       cost_of_funds: float = 0.01,
+                       opex_ratio: float = 0.005,
+                       capital_charge: float = 0.02
+                       ) -> float:
+    lgd = _DEFAULT_LGD_TABLE.get(rating, 0.45)
+    expected_loss = pd_hat * lgd
+    margin = expected_loss + cost_of_funds + opex_ratio + capital_charge
+    return max(margin, 0.005)
+
 class DecisionEngine:
     def __init__(
         self, cfg: BusinessFrame, *, edges: Sequence[float] | None = None
@@ -335,15 +351,22 @@ class DecisionEngine:
     def _band(exposure: float) -> str:
         return "<1M" if exposure < 1_000_000 else ">=1M"
 
-    def decide(self, pd_hat: float, exposure: float, **extra: Any) -> Dict[str, Any]:
+    def decide(self, pd_hat: float, exposure: float, **extra) -> Dict[str, Any]:
         idx = np.searchsorted(self.edges, pd_hat, side="right")
         rating = self.labels[idx]
+        band   = self._band(exposure)
+
         rule = (
-            self.mat.get(rating, {}).get(self._band(exposure))
-            or self.mat.get(rating, {}).get("*")
+            self.mat.get(rating, {}).get(band)   # exact match
+            or self.mat.get(rating, {}).get("*") # wildcard
             or {"action": "DECLINE"}
         )
-        out = {"rating": rating, **rule}
+
+        if rule.get("action") == "PRICE_UP":
+            dyn_spread = risk_based_spread(pd_hat, rating,**_DEFAULT_RATIOS)
+            rule = {**rule, "spread_bps": int(round(dyn_spread * 1e4))}
+
+        out = {**rule}
         out.update(extra)
         return out
 
@@ -356,6 +379,30 @@ def psi(expected: NDArray[np.float_], actual: NDArray[np.float_], bins: int = 10
     a_cnt, _ = np.histogram(actual,   bins=cuts)
     e_pct, a_pct = e_cnt / e_cnt.sum(), a_cnt / a_cnt.sum()
     return float(((a_pct - e_pct) * np.log((a_pct + 1e-9) / (e_pct + 1e-9))).sum())
+
+# --------------------------------------------------------------------------- #
+# Fair-lending metrics
+# --------------------------------------------------------------------------- #
+
+def disparate_impact(y_pred: np.ndarray,
+                     group: pd.Series,
+                     protected_val) -> float:
+    """Approval-rate protected ÷ approval-rate reference."""
+    mask = group == protected_val
+    appr_prot = y_pred[mask].mean()
+    appr_ref  = y_pred[~mask].mean()
+    return appr_prot / appr_ref if appr_ref else np.nan
+
+
+def equal_opportunity_diff(y_true: np.ndarray,
+                           y_pred: np.ndarray,
+                           group: pd.Series,
+                           protected_val) -> float:
+    """TPR_protected − TPR_reference (≈ 0 is best)."""
+    def _tpr(mask):
+        tn, fp, fn, tp = confusion_matrix(y_true[mask], y_pred[mask]).ravel()
+        return tp / (tp + fn) if (tp + fn) else np.nan
+    return _tpr(group == protected_val) - _tpr(group != protected_val)
 
 
 # ── transformers ────────────────────────────────────────────────────────────
@@ -568,6 +615,7 @@ def _parse_date(val):  # type: ignore[override]
 
 def _load_macro_file(path: Path, colname: str, *, derive_growth: bool, ma_years: int = 2) -> pd.DataFrame:
     """Read wide CSV → latest (country, value) pairs."""
+    meta = load_country_meta()
     if not path.exists():
         return pd.DataFrame(columns=["country", colname])
 
@@ -581,7 +629,8 @@ def _load_macro_file(path: Path, colname: str, *, derive_growth: bool, ma_years:
         .dropna(subset=["year", "value"])
     )
     long = long[long.year <= TODAY.year]
-
+    long["country_code"] = (long["country"].astype(str).apply(lambda x: resolve_country_fuzzy(x, meta)))
+    long = long.dropna(subset=["country_code"])
     if derive_growth:
         long = long.sort_values(["country", "year"])
         long["value"] = (
@@ -595,13 +644,12 @@ def _load_macro_file(path: Path, colname: str, *, derive_growth: bool, ma_years:
             lambda s: s.rolling(ma_years, min_periods=1).mean()
         )
 
-    latest_idx = long.groupby("country")["year"].idxmax()
-    latest = long.loc[latest_idx, ["country", "value"]].rename(columns={"value": colname})
+    latest_idx = long.groupby("country_code")["year"].idxmax()
+    latest = long.loc[latest_idx, ["country_code", "value"]].rename(columns={"value": colname})
     return latest
 
 
 def _join_macro_pl(df: pl.DataFrame) -> pl.DataFrame:
-    meta = load_country_meta()
     if not any(p.exists() for p,u in MACRO_FILES.values()):
         return df
 
@@ -612,18 +660,13 @@ def _join_macro_pl(df: pl.DataFrame) -> pl.DataFrame:
 
     macro_df = frames[0]
     for f in frames[1:]:
-        macro_df = macro_df.merge(f, on="country", how="outer")
+        macro_df = macro_df.merge(f, on="country_code", how="outer")
         macro_df
-    macro_df["country_code"] = (macro_df["country"].astype(str).apply(lambda x: resolve_country_fuzzy(x, meta)))
-
-    macro_pl = pl.from_pandas(macro_df.drop(columns=["country"])).drop_nulls("country_code")
+    macro_pl = pl.from_pandas(macro_df).drop_nulls("country_code")
 
     return df.join(macro_pl, on="country_code", how="left")
 
 def _generate_country_meta() -> pd.DataFrame:
-    """Generate *once* a meta table with ISO3, ISO2, official/common
-    names, capital, subregion. Requires `pycountry` and `CountryInfo` on a
-    machine with internet (first run only)."""
     import pycountry
     from countryinfo import CountryInfo
 
@@ -636,18 +679,21 @@ def _generate_country_meta() -> pd.DataFrame:
             getattr(c, "official_name", None),
             getattr(c, "common_name", None),
         ]))
-        try:
-            info = CountryInfo(c.name)
-            capital = info.capital() or ""
-            subregion = info.subregion() or ""
-        except Exception:  # noqa: BLE001
-            capital, subregion = "", ""
+        try: 
+            info = CountryInfo(iso2.upper()).info()
+            capital = info.get('capital', '')
+            subregion = info.get('subregion', '')
+            currency=info.get('currencies', '')[0]
+        except:
+            info, capital, subretion, currency='','','',''
+        
         records.append({
             "iso3": iso3,
             "iso2": iso2,
             "names": ";".join(sorted(names)),
             "capital": capital,
             "subregion": subregion,
+            "currency":currency
         })
     meta = pd.DataFrame.from_records(records)
     meta.to_csv(_META_FILE, index=False)
@@ -655,7 +701,6 @@ def _generate_country_meta() -> pd.DataFrame:
 
 
 def load_country_meta(force_refresh: bool = False) -> pd.DataFrame:
-    """Return the **static** country meta table, generating it on first call."""
     if force_refresh or not _META_FILE.exists():
         return _generate_country_meta()
     return pd.read_csv(_META_FILE)
@@ -762,26 +807,24 @@ def _add_url_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 # ───────────────────────────── load_dataset ────────────────────────────────
 
-def load_dataset(csv: str | Path, cfg: BusinessFrame, *, training: bool) -> pd.DataFrame:
+def load_dataset(csv: str | Path, cfg: BusinessFrame) -> pd.DataFrame:
     """Snapshot → pandas DataFrame with momentum & macro‑ready features."""
     df = pd.read_csv(csv)
-
     # 1. status cleaning ----------------------------------------------------
     df["status"] = df["status"].astype(str).str.lower().str.strip()
     df = df[df["status"].isin(cfg.good_statuses + cfg.bad_statuses)].copy()
-
     # 2. core dates ---------------------------------------------------------
     for col in ["founded_at", "first_funding_at", "last_funding_at"]:
         df[col] = df[col].apply(_parse_date).dt.tz_localize(None)
-
     # founded_at repair
     cutoff = pd.Timestamp(year=1315,month=1,day=1)
     bad = (df["founded_at"] < cutoff) | (df["founded_at"] > pd.Timestamp(TODAY))
     df.loc[bad, "founded_at"] = df.loc[bad, "first_funding_at"]
-
+    
     # 3. horizon filter ----------------------------------------------------
-    age_months = (pd.Timestamp(TODAY) - df["founded_at"]).dt.days / 30.44
-    df = df[age_months >= cfg.horizon_months]
+    #age_months = (pd.Timestamp(TODAY) - df["founded_at"]).dt.days / 30.44
+    #df = df[age_months >= cfg.horizon_months]
+    #commented out due to taking out NaN rows
 
     # 4. target & weights --------------------------------------------------
     df["target"] = df["status"].isin(cfg.bad_statuses).astype(int)
@@ -795,7 +838,7 @@ def load_dataset(csv: str | Path, cfg: BusinessFrame, *, training: bool) -> pd.D
     df["diff_founded_last_funding_days"] = (df["last_funding_at"] - df["founded_at"]).dt.days
     df["diff_founded_first_funding_days"] = (df["first_funding_at"] - df["founded_at"]).dt.days
     df["diff_between_fundings_days"] = (df["last_funding_at"] - df["first_funding_at"]).dt.days
-
+    
     # 6. numeric sanitation -------------------------------------------------
     df["funding_total_usd"] = pd.to_numeric(df["funding_total_usd"].astype(str).str.replace("-", ""), errors="coerce")
 
@@ -803,7 +846,7 @@ def load_dataset(csv: str | Path, cfg: BusinessFrame, *, training: bool) -> pd.D
     df["category_list"] = df["category_list"].fillna("").astype(str).str.split("|")
     df["category_list_len"] = df["category_list"].apply(len)
     df["primary_sector"] = df["category_list"].apply(lambda lst: (lst[0] if lst else "").lower())
-
+    
     # 8. funding momentum (raw) -------------------------------------------
     df["funding_per_round"] = df["funding_total_usd"] / (df["funding_rounds"] + 1e-6)
     df["rounds_per_year"] = df["funding_rounds"] / (df["years_since_founded"] + 1e-6)
@@ -818,16 +861,15 @@ def load_dataset(csv: str | Path, cfg: BusinessFrame, *, training: bool) -> pd.D
         df.loc[need_cc, "homepage_url"].astype(str).str.extract(r"\.([a-zA-Z]{2})$", expand=False).str.upper().map(_country_2_3)
     )
     df.loc[need_cc, "country_code"] = cc_from_domain
-    df["subregion"] = df["country_code"].map(_sub_map)
-
+    
     # 10. macro join -------------------------------------------------------
     df = _join_macro(df)
-
+    
     # 10b Governance ------------------------------------------------------
     gov_df = _load_regulatory_framework()
     df = df.merge(gov_df, how="left", left_on="country_code", right_on="iso3")
     df.drop(columns=["iso3"], inplace=True, errors="ignore")
-
+    
     # 11 Interactions -----------------------------------------------------
     for m in MACRO_COLS:
         if m in df.columns:
@@ -835,10 +877,10 @@ def load_dataset(csv: str | Path, cfg: BusinessFrame, *, training: bool) -> pd.D
 
     # 12 Capital ----------------------------------------------------------
     meta = load_country_meta()
-    df = df.merge(meta[["iso3", "capital"]], how="left", left_on="country_code", right_on="iso3")
-    df["capital_dummy"] = (~df["capital"].isna()).astype(int)
+    df = df.merge(meta[["iso3", "capital","subregion","currency"]], how="left", left_on="country_code", right_on="iso3")
+    df["capital_dummy"] = (df["city"] == df["capital"]).astype(int)
     df.drop(columns=["iso3"], inplace=True, errors="ignore")
-
+    
     # 13 URL features -----------------------------------------------------
     df = _add_url_features(df)
 
@@ -977,7 +1019,7 @@ def tune_hyperparams(
     w: NDArray[np.float_],
     *,
     model_type: str="xgb",
-    n_trials: int = 2,
+    n_trials: int = 8,
 ) -> dict:
     """Return best params (conditional on *model_type*)."""
 
@@ -1078,65 +1120,76 @@ def plot_calibration_band(band: Dict[str, np.ndarray], *, ax: plt.Axes | None = 
 
 GLOBAL_SEED = 42
 
-def train(csv: str | Path, model_out: str | Path, cfg_path: str | Path | None):
-    """Full training pipeline with patches and calibration bands."""
+
+def train(csv: str | Path,
+          model_out: str | Path,
+          cfg_path: str | Path | None,
+          model_type: str = "xgb"):
+    """Full training pipeline with patches, calibration bands, extended SHAP and metrics exports.
+
+    Parameters
+    ----------
+    csv : str or Path
+        Path to input CSV dataset.
+    model_out : str or Path
+        Output filepath (should end with .joblib or .pkl) for model bundle.
+        Can be a directory path: if so, model will be saved as <dir>/model.joblib.
+    cfg_path : str or Path or None
+        Path to model config file.
+    model_type : str
+        One of ["xgb", "lgb", ...] indicating the underlying model.
+    """
 
     # --- load config ----------------------------------------------------
-    cfg = read_cfg(cfg_path)  # noqa: F821
+    cfg = read_cfg(cfg_path)
     if not cfg.decision_matrix:
-        cfg.decision_matrix = DEFAULT_DEC_MATRIX  # noqa: F821
-
+        cfg.decision_matrix = DEFAULT_DEC_MATRIX
     cfg.use_lgd = getattr(cfg, "use_lgd", False)
     cfg.rating_edges = getattr(cfg, "rating_edges", None)
 
     # --- data -----------------------------------------------------------
-    df = load_dataset(csv, cfg, training=True)  # noqa: F821
+    df = load_dataset(csv, cfg)
+    df["row_id"] = np.arange(len(df))
     X = df.drop(columns=["target", "weight"])
     y = df["target"].values
     w = df["weight"].values
 
+    # split for build, calibration, threshold tuning
+    X_tv, X_test, y_tv, y_test, w_tv, w_test = train_test_split(
+        X, y, w, test_size=0.20, stratify=y, random_state=GLOBAL_SEED)
+    test_ids = df.loc[X_test.index, "row_id"].tolist()
     X_build, X_hold, y_build, y_hold, w_build, w_hold = train_test_split(
-        X, y, w, test_size=0.20, stratify=y, random_state=GLOBAL_SEED
-    )
+        X_tv, y_tv, w_tv, test_size=0.25, stratify=y_tv, random_state=GLOBAL_SEED)
     X_cal, X_thr, y_cal, y_thr, w_cal, w_thr = train_test_split(
-        X_hold, y_hold, w_hold, test_size=0.50, stratify=y_hold, random_state=GLOBAL_SEED
-    )
+        X_hold, y_hold, w_hold, test_size=0.50, stratify=y_hold, random_state=GLOBAL_SEED)
 
-    # --- preprocessing & monotone vector --------------------------------
-    pre = build_preprocessor()  # noqa: F821
+    # --- preprocessing & monotonicity -------------------------------
+    pre = build_preprocessor()
     pre.fit(X_build, y_build)
     feat_names = pre["cols"].get_feature_names_out()
     mono_vec = build_monotone_constraints(feat_names)
 
-    # --- model & hyper‑param tuning ------------------------------------
-    base_clf = build_model(len(feat_names), monotone_constraints=mono_vec)
+    # --- hyperparameter tuning -----------------------------------------
+    base_clf = build_model(len(feat_names), monotone_constraints=mono_vec, model_type=model_type)
     pipe_base = Pipeline([("pre", clone(pre)), ("clf", base_clf)])
-    best_params = tune_hyperparams(pipe_base, X_build, y_build, w_build)  # noqa: F821
+    best_params = tune_hyperparams(pipe_base, X_build, y_build, w_build)
 
-    final_clf = build_model(len(feat_names), monotone_constraints=mono_vec, params=best_params)
+    # --- final training -------------------------------------------------
+    final_clf = build_model(
+        len(feat_names), monotone_constraints=mono_vec,
+        params=best_params, model_type=model_type)
     pipe = Pipeline([("pre", pre), ("clf", final_clf)])
     pipe.fit(X_build, y_build, clf__sample_weight=w_build)
 
     # --- calibration ----------------------------------------------------
-    cal_pred_raw = pipe.predict_proba(X_cal)[:, 1]
-    iso = IsotonicRegression(out_of_bounds="clip").fit(cal_pred_raw, y_cal, sample_weight=w_cal)
+    cal_scores = pipe.predict_proba(X_cal)[:, 1]
+    iso = IsotonicRegression(out_of_bounds="clip").fit(cal_scores, y_cal, sample_weight=w_cal)
+    cal_pred = iso.predict(cal_scores)
+    thr_scores = iso.predict(pipe.predict_proba(X_thr)[:, 1])
 
-    cal_pred = iso.predict(cal_pred_raw)
-    thr_pred = iso.predict(pipe.predict_proba(X_thr)[:, 1])
-
-    thr = optimise_threshold(
-        y_thr,
-        thr_pred,
-        w_thr,
-        cost_fn=cfg.cost_fn,
-        cost_fp=cfg.cost_fp,
-    )  # noqa: F821
-
-    # --- performance metrics ------------------------------------------
-    auc_thr = roc_auc_score(y_thr, thr_pred, sample_weight=w_thr)
-    brier_thr = brier_score_loss(y_thr, thr_pred, sample_weight=w_thr)
-    logging.info("AUC=%.4f, Brier=%.4f, Threshold=%.4f", auc_thr, brier_thr, thr)
-
+    thr = optimise_threshold(y_thr, thr_scores, w_thr,
+                             cost_fn=cfg.cost_fn, cost_fp=cfg.cost_fp)
+    
     # --- rating edges --------------------------------------------------
     edges = optimise_edges(
         y_build,
@@ -1145,67 +1198,115 @@ def train(csv: str | Path, model_out: str | Path, cfg_path: str | Path | None):
     )  # noqa: F821
     cfg.rating_edges = tuple(edges)
 
-    # ── SHAP explainability ────────────────────────────────────────────────
-    shap_imp: NDArray | None = None
-    shap_paths: dict[str, Path] | None = None
+    # --- performance metrics -------------------------------------------
+    test_scores = iso.predict(pipe.predict_proba(X_test)[:, 1])
+    auc_test = roc_auc_score(y_test, test_scores, sample_weight=w_test)
+    brier_test = brier_score_loss(y_test, test_scores, sample_weight=w_test)
+    logging.info("AUC=%.4f, Brier=%.4f, Threshold=%.4f", auc_test, brier_test, thr)
+
+    # compute ROC and PR curves
+    fpr, tpr, roc_thresh = roc_curve(y_test, test_scores, sample_weight=w_test)
+    precision, recall, pr_thresh = precision_recall_curve(y_test, test_scores, sample_weight=w_test)
+
+    # prepare output directory
+    model_out = Path(model_out)
+    if model_out.is_dir():
+        out_dir = model_out
+        model_file = out_dir / f"model_{model_type}.joblib"
+    else:
+        out_dir = model_out.parent
+        model_file = model_out
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # save ROC and PR data
+    roc_df = np.vstack([fpr, tpr, roc_thresh]).T
+    roc_path = out_dir / f"{model_file.stem}_{model_type}_roc.csv"
+    np.savetxt(roc_path, roc_df, delimiter=",",
+               header="fpr,tpr,threshold", comments='')
+
+    pr_df = np.vstack([precision, recall, np.append(pr_thresh, np.nan)]).T
+    pr_path = out_dir / f"{model_file.stem}_{model_type}_pr.csv"
+    np.savetxt(pr_path, pr_df, delimiter=",",
+               header="precision,recall,threshold", comments='')
+
+    # --- SHAP explainability --------------------------------------------
+    shap_folder = out_dir / f"{model_file.stem}_{model_type}_shap"
+    shap_folder.mkdir(exist_ok=True)
+    shap_paths = {}
     try:
-        # 1. Build the explainer on the *pre-processed* design matrix ----------------
-        X_build_pre = pre.transform(X_build)
-        explainer = shap.Explainer(final_clf, X_build_pre, feature_names=feat_names)
+        Xb_pre = pre.transform(X_build)
+        explainer = shap.Explainer(final_clf, Xb_pre, feature_names=feat_names)
+        shap_vals = explainer(Xb_pre)
+        vals = shap_vals.values
+        # global importance
+        imp = np.abs(vals).mean(axis=0)
+        np.savetxt(shap_folder / f"feature_importance_{model_type}.csv", imp,
+                   delimiter=",", header=','.join(feat_names), comments='')
+        # bar plot
+        ax = shap.plots.bar(shap_vals, max_display=20, show=False)
+        fig = ax.get_figure()
+        fig.savefig(shap_folder / f"shap_bar_top20_{model_type}.png", dpi=180,bbox_inches="tight",)
+        plt.close(fig)
 
-        # 2. Compute the SHAP values only once ---------------------------------------
-        shap_values = explainer(X_build_pre)          # a shap.Values object
-        shap_array   = shap_values.values             # (n_samples, n_features)
-        shap_imp     = np.abs(shap_array).mean(axis=0)
+        # beeswarm
+        ax = shap.plots.beeswarm(shap_vals, max_display=20, show=False)
+        fig = ax.get_figure()
+        fig.savefig(shap_folder / f"shap_beeswarm_top20_{model_type}.png", dpi=180,bbox_inches="tight",)
+        plt.close(fig)
 
-        # 3. Produce two ready-to-share figures --------------------------------------
-        #    (a) bar plot with mean |SHAP| of the 20 most important features
-        bar_path = Path(model_out).with_name(f"{Path(model_out).stem}_shap_bar_top20.png")
-        shap.plots.bar(shap_values, max_display=20, show=False)
-        plt.tight_layout()
-        plt.savefig(bar_path, dpi=180)
-        plt.close()
+        # waterfall for top 3 observations
+        for idx in np.argsort(-imp)[:3]:
+            ax = shap.plots.waterfall(shap_vals[idx], show=False)
+            fig = ax.get_figure()
+            fig.savefig(shap_folder / f"waterfall_obs_{idx}_{model_type}.png", dpi=180,bbox_inches="tight",)
+            plt.close(fig)
 
-        #    (b) beeswarm plot for the same 20 features (nice for distribution view)
-        bee_path = Path(model_out).with_name(f"{Path(model_out).stem}_shap_beeswarm_top20.png")
-        shap.plots.beeswarm(shap_values, max_display=20, show=False)
-        plt.tight_layout()
-        plt.savefig(bee_path, dpi=180)
-        plt.close()
-
-        shap_paths = {"bar": bar_path, "beeswarm": bee_path}
-        logging.info("SHAP plots saved to %s and %s", bar_path, bee_path)
-
+        shap_paths = {p.name: p for p in shap_folder.iterdir()}
+        logging.info("SHAP plots saved in %s", shap_folder)
     except Exception as exc:
-        # SHAP can fail if the model type is not supported; we don’t want to block training.
-        logging.warning("Skipping SHAP explainability – %s: %s", type(exc).__name__, exc)
-        shap_imp   = None
-        shap_paths = None
+        logging.warning("Skipping SHAP – %s", exc)
 
-
-
-    # --- calibration band (stored for dashboards) ----------------------
+    # --- calibration band ------------------------------------------------
     calib_band = bootstrap_calibration_band(cal_pred, y_cal, sample_weight=w_cal)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    plot_calibration_band(calib_band)
+    fig.savefig(out_dir / f"calib_band_{model_type}.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    
 
+    # --- metadata and bundle ---------------------------------------------
     meta = {
         "trained": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "auc_thr": auc_thr,
-        "brier_thr": brier_thr,
+        "auc_thr": auc_test,
+        "brier_thr": brier_test,
         "threshold": thr,
-        "edges": edges,
+        "edges":edges,
+        "roc_path": str(roc_path),
+        "pr_path": str(pr_path),
+        "shap_folder": str(shap_folder),
         "best_params": best_params,
         "cfg": cfg.__dict__,
-        "calib_band": calib_band,
+        "calib_band":calib_band,
+        "test_row_ids": test_ids,
     }
+    bundle = {"pipe": pipe, "iso": iso, "meta": meta,"psi_ref": iso.predict(pipe.predict_proba(X)[:, 1]),}
+    y_pred_test = (test_scores < thr).astype(int)
+    fairness = {}
+    audits = [("country_code", "IRN"),
+              ("primary_sector", "fintech")]
 
-    bundle = {
-        "pipe": pipe,
-        "iso": iso,
-        "meta": meta,
-        "psi_ref": iso.predict(pipe.predict_proba(X)[:, 1]),
-    }
-    joblib.dump(bundle, model_out)
-    logging.info("✔︎ Saved model (with calibration band) to %s", model_out)
+    for col, prot in audits:
+        fairness[f"{col}_{prot}_DI"]  = disparate_impact(y_pred_test, X_test[col], prot)
+        if "target" in X_test:  
+            fairness[f"{col}_{prot}_EOD"] = equal_opportunity_diff(
+                y_test, y_pred_test, X_test[col], prot)
+
+    meta["fairness"] = fairness
+    joblib.dump(bundle, model_file)
+    logging.info("Saved model to %s", model_file)
+
+    return bundle
+
 
 
 ################################################################################
@@ -1217,7 +1318,7 @@ def score(model_path: str | Path, csv_in: str | Path, csv_out: str | Path):
     cfg = BusinessFrame(**bundle["meta"]["cfg"])  # upgraded dataclass
 
     # --- data -----------------------------------------------------------
-    df = load_dataset(csv_in, cfg, training=False)  # noqa: F821
+    df = load_dataset(csv_in, cfg)  # noqa: F821
     pd_hat = bundle["iso"].predict(bundle["pipe"].predict_proba(df)[:, 1])
     df["pd_hat"] = pd_hat
 
@@ -1241,7 +1342,9 @@ def score(model_path: str | Path, csv_in: str | Path, csv_out: str | Path):
         for p, e, l in zip(df["pd_hat"], df["exposure"], df["lgd_est"])
     ]
     df = pd.concat([df, pd.DataFrame(decisions)], axis=1)
-
+    df["row_id"] = np.arange(len(df))
+    test_ids = set(bundle["meta"]["test_row_ids"])
+    df["is_test"] = df["row_id"].isin(test_ids).astype(int)
     # --- drift metrics --------------------------------------------------
     ref = bundle["psi_ref"]
     logging.info("PSI vs train: %.4f", psi(ref, pd_hat))  # noqa: F821
@@ -1252,6 +1355,391 @@ def score(model_path: str | Path, csv_in: str | Path, csv_out: str | Path):
 
     df.to_csv(csv_out, index=False)
     logging.info("✔︎ Scored → %s", csv_out)
+
+# ─────────────────────────────────────────────────────────────────────
+#  Scoring + visuals
+# ─────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# 1  ▸  THRESHOLD‑COST CURVE
+# ---------------------------------------------------------------------
+
+def _expected_cost(pd_hat: np.ndarray,
+                   y_true: np.ndarray,
+                   thr: float,
+                   *,
+                   cost_fn: float = 5.0,
+                   cost_fp: float = 1.0,
+                   sample_weight: np.ndarray | None = None) -> float:
+    """Return mis‑classification cost at *thr*."""
+
+    sw = np.ones_like(pd_hat) if sample_weight is None else sample_weight
+    y_pred = (pd_hat >= thr).astype(int)
+    fn = ((y_true == 1) & (y_pred == 0)).astype(float) * sw  # false‑negatives
+    fp = ((y_true == 0) & (y_pred == 1)).astype(float) * sw  # false‑positives
+    return cost_fn * fn.sum() + cost_fp * fp.sum()
+
+
+def plot_threshold_cost_curve(pd_hat: np.ndarray,
+                              y_true: np.ndarray,
+                              *,
+                              sample_weight: np.ndarray | None = None,
+                              cost_fn: float = 5.0,
+                              cost_fp: float = 1.0,
+                              chosen_thr: float | None = None,
+                              ax: plt.Axes | None = None):
+    """Plot cost vs. threshold and highlight *chosen_thr*."""
+    ax = ax or plt.gca()
+    thr_grid = np.linspace(0.0, 1.0, 201)
+    costs = [_expected_cost(pd_hat, y_true, t,
+                            cost_fn=cost_fn, cost_fp=cost_fp,
+                            sample_weight=sample_weight) for t in thr_grid]
+    ax.plot(thr_grid, costs, lw=2)
+    if chosen_thr is not None:
+        ax.axvline(chosen_thr, color="red", lw=2, ls="--", label=f"chosen θ = {chosen_thr:.3f}")
+        chosen_cost = _expected_cost(pd_hat, y_true, chosen_thr,
+                                     cost_fn=cost_fn, cost_fp=cost_fp,
+                                     sample_weight=sample_weight)
+        ax.scatter([chosen_thr], [chosen_cost], color="red", zorder=5)
+    ax.set_xlabel("Threshold (θ)")
+    ax.set_ylabel("Expected cost")
+    ax.set_title("Threshold‑cost Curve")
+    ax.legend()
+    return ax
+
+# ──────────────────────────────────────────────────────────────────────
+# 2  ▸  GRADE‑EDGE BEESWARM
+# ---------------------------------------------------------------------
+
+def _jitter(n: int, scale: float = 0.08) -> np.ndarray:
+    return (np.random.rand(n) - 0.5) * scale
+
+
+def plot_grade_beeswarm(pd_hat: np.ndarray,
+                        ratings: np.ndarray,
+                        *,
+                        rating_labels: list[str] | None = None,
+                        ax: plt.Axes | None = None):
+    """Beeswarm of PDs coloured by credit grade."""
+    from matplotlib.ticker import PercentFormatter
+    ax = ax or plt.gca()
+    uniq = rating_labels or sorted(pd.unique(ratings))
+    y_positions = {lbl: i for i, lbl in enumerate(uniq)}
+    for lbl in uniq:
+        mask = ratings == lbl
+        ax.scatter(pd_hat[mask],
+                   np.full(mask.sum(), y_positions[lbl]) + _jitter(mask.sum()),
+                   s=10, alpha=0.7, label=lbl)
+    ax.set_yticks(list(y_positions.values()), uniq)
+    ax.set_xlabel("Calibrated PD")
+    ax.set_title("Grade‑edge Beeswarm")
+    ax.xaxis.set_major_formatter(PercentFormatter(1))
+    ax.legend(title="Rating", bbox_to_anchor=(1.04, 1), loc="upper left")
+    return ax
+
+# ──────────────────────────────────────────────────────────────────────
+# 3  ▸  PORTFOLIO PD HISTOGRAM
+# ---------------------------------------------------------------------
+
+def plot_pd_histogram(pd_hat: np.ndarray,
+                      ratings: np.ndarray,
+                      *,
+                      ax: plt.Axes | None = None,
+                      bins: int = 40):
+    from matplotlib.ticker import PercentFormatter
+    from collections import Counter
+    ax = ax or plt.gca()
+    ax.hist(pd_hat, bins=bins, alpha=0.7, color="steelblue")
+    ax.set_xlabel("Calibrated PD")
+    ax.xaxis.set_major_formatter(PercentFormatter(1))
+    ax.set_ylabel("Count")
+    ax.set_title("Portfolio PD Distribution")
+    # annotate share per grade
+    counts = Counter(ratings)
+    total = len(ratings)
+    txt = "\n".join(f"{g}: {c/total:.0%}" for g, c in counts.items())
+    ax.text(0.98, 0.95, txt, va="top", ha="right", transform=ax.transAxes,
+            bbox=dict(boxstyle="round", fc="white", ec="grey", alpha=0.7))
+    return ax
+
+# ──────────────────────────────────────────────────────────────────────
+# 4  ▸  DECISION‑MATRIX HEATMAP
+# ---------------------------------------------------------------------
+
+_action_palette = {
+    "APPROVE":    "#60b044",
+    "COLLATERAL": "#e6b800",
+    "PRICE_UP":   "#e67e22",
+    "DECLINE":    "#c0392b",
+}
+
+def plot_decision_matrix_heatmap(decision_matrix: dict[str, dict[str, dict]],
+                                 *,
+                                 ax: plt.Axes | None = None):
+    """Clean 2-D credit-policy grid: X = exposure band, Y = rating."""
+    import matplotlib.colors as mcolors
+    import textwrap
+
+    if ax is None:                       # create a roomier canvas by default
+        _, ax = plt.subplots(figsize=(6, 5))
+
+    ratings = list(decision_matrix)
+    expos   = sorted({band for r in decision_matrix.values() for band in r})
+
+    # build action + colour grid
+    action_grid = np.empty((len(ratings), len(expos)), dtype=object)
+    colour_grid = np.empty_like(action_grid, dtype=object)
+
+    for i, rating in enumerate(ratings):
+        for j, band in enumerate(expos):
+            rule = (decision_matrix[rating].get(band)
+                    or decision_matrix[rating].get("*", {}))
+            act = rule.get("action", "DECLINE")
+            action_grid[i, j] = act
+            colour_grid[i, j] = mcolors.to_rgba(_action_palette.get(act, "lightgrey"))
+
+    ax.imshow(colour_grid)
+
+    # pretty axis labels
+    ax.set_xticks(range(len(expos)), expos)
+    ax.set_yticks(range(len(ratings)), ratings)
+    ax.set_xlabel("Exposure band")
+    ax.set_ylabel("Rating grade")
+    ax.set_title("Decision-matrix Heatmap", pad=15)
+
+    # write the text inside each cell (wrap if needed)
+    for (i, j), act in np.ndenumerate(action_grid):
+        short = "\n".join(textwrap.wrap(act, 10))   # max 10 chars per line
+        ax.text(j, i, short, ha="center", va="center",
+                color="white", fontsize=9, fontweight="bold")
+
+    ax.set_frame_on(False)
+    plt.tight_layout()
+    return ax
+
+# ──────────────────────────────────────────────────────────────────────
+# 5  ▸  APPROVAL FUNNEL
+# ---------------------------------------------------------------------
+
+def plot_approval_funnel(counts: dict[str, int],
+                         *,
+                         ax: plt.Axes | None = None,
+                         bar_color: str = "steelblue"):
+    """Horizontal bar cascade with smart in-bar labels."""
+    stages = list(counts)
+    vals   = np.array([counts[s] for s in stages])
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 4))
+
+    ax.barh(stages, vals, color=bar_color, height=0.6)
+
+    # annotate
+    x_max = vals.max()
+    for y, (label, v) in enumerate(zip(stages, vals)):
+        txt = f"{v:,.0f}"
+        # if bar is long enough, print inside; else print outside
+        if v > 0.15 * x_max:
+            ax.text(v * 0.5, y, txt, ha="center", va="center",
+                    color="white", fontsize=11, fontweight="bold")
+        else:
+            ax.text(v + x_max * 0.01, y, txt, va="center",
+                    color="black", fontsize=11, fontweight="bold")
+
+    ax.invert_yaxis()
+    ax.set_xlabel("Applications")
+    ax.set_title("Approval Funnel", pad=15)
+    ax.set_xlim(0, x_max * 1.05)
+    ax.set_frame_on(False)
+    plt.tight_layout()
+    return ax
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 6  ▸  STRESS SCENARIOS (PD‑ONLY)
+# ---------------------------------------------------------------------
+SCENARIO_MATRIX = pd.DataFrame({
+    "scenario": ["Mild", "Moderate", "Severe"],
+    "pd_scalar": [1.10, 1.25, 1.50],
+})
+
+
+def apply_stress_scenarios(pd_hat: np.ndarray,
+                           ead: np.ndarray,
+                           ratings: np.ndarray,
+                           *,
+                           threshold: float,
+                           edges: list[float],
+                           scenarios: pd.DataFrame = SCENARIO_MATRIX) -> pd.DataFrame:
+    """Return approval‑rate and grade‑migration matrices per PD‑only scenario."""
+
+    records: list[dict] = []
+    base_rating = ratings.copy()
+    for _, row in scenarios.iterrows():
+        scl = row.pd_scalar
+        pd_shock = np.clip(pd_hat * scl, 0, 1)
+        approve_rate = float((pd_shock < threshold).mean())
+        new_rating = np.searchsorted(edges, pd_shock, side="right")
+        migr = pd.crosstab(base_rating, new_rating, normalize="index")
+        records.append({
+            "scenario": row.scenario,
+            "approval_rate": approve_rate,
+            "migration": migr,
+        })
+    return pd.DataFrame(records)
+
+# ──────────────────────────────────────────────────────────────────────
+# 7  ▸  PORTFOLIO PD BAR PLOT
+# ---------------------------------------------------------------------
+
+def plot_portfolio_pd_bars(res_df: pd.DataFrame, *, ax: plt.Axes | None = None):
+    """Show approval‑rate impact across scenarios."""
+    from matplotlib.ticker import PercentFormatter
+    ax = ax or plt.gca()
+    x = np.arange(len(res_df))
+    ax.bar(x, res_df.approval_rate, width=0.55, color="steelblue")
+    ax.set_xticks(x, res_df.scenario)
+    ax.set_ylabel("Approval rate")
+    ax.yaxis.set_major_formatter(PercentFormatter(1))
+    ax.set_title("Approval Rate by Scenario")
+    return ax
+
+def score(model_path: str | Path,
+          csv_in: str | Path,
+          csv_out: str | Path,
+          *,
+          plots_dir: str | Path | None = None):
+    # --- load model & data ───────────────────────────────────────────
+    bundle = joblib.load(model_path)
+    cfg = BusinessFrame(**bundle["meta"]["cfg"])
+
+    df   = load_dataset(csv_in, cfg)
+    pipe = bundle["pipe"]
+    iso  = bundle["iso"]
+
+    pd_hat = iso.predict(pipe.predict_proba(df)[:, 1])
+    df["pd_hat"] = pd_hat
+
+    # credit grade -----------------------------------------------------
+    cfg.rating_edges = tuple(bundle["meta"]["edges"])
+    df["rating"] = np.searchsorted(cfg.rating_edges, pd_hat, side="right")
+    df["rating"] = df["rating"].map(dict(enumerate(cfg.labels)))
+    
+    # EAD fallback
+    if "exposure" not in df:
+        df["exposure"] = 500_000
+
+    # optional LGD (unchanged)
+    if cfg.use_lgd:
+        df["lgd_est"] = df.apply(estimate_lgd, axis=1)
+    else:
+        df["lgd_est"] = np.nan
+
+    # decisions (unchanged)
+    dec_engine = DecisionEngine(cfg)
+    decisions = [
+        dec_engine.decide(p, e, lgd=(l if cfg.use_lgd else None))
+        for p, e, l in zip(df["pd_hat"], df["exposure"], df["lgd_est"])
+    ]
+    df = pd.concat([df, pd.DataFrame(decisions)], axis=1)
+
+    # drift metrics
+    ref = bundle["psi_ref"]
+    logging.info("PSI vs train: %.4f", psi(ref, pd_hat))
+    logging.info("K-S statistic: %.4f", ks_2samp(ref, pd_hat)[0])
+
+    # hard decline flag
+    thr = bundle["meta"].get("threshold", 0.5)
+    df["hard_decline"] = (pd_hat >= thr).astype(int)
+
+    # save scored CSV
+    df.to_csv(csv_out, index=False)
+    logging.info("✔︎ Scored → %s", csv_out)
+
+    # --- create plot folder ───────────────────────────────────────────
+    plots_dir = (
+        Path(plots_dir) if plots_dir
+        else Path(csv_out).with_suffix('').with_name(Path(csv_out).stem + '_plots')
+    )
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+
+    # 1 ▸ threshold-cost (only if we have ground-truth)
+    if "target" in df.columns:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        plot_threshold_cost_curve(pd_hat,
+                                  df["target"].values,
+                                  sample_weight=df.get("weight"),
+                                  chosen_thr=thr,
+                                  ax=ax)
+        fig.savefig(plots_dir / "threshold_cost.png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+    # 2 ▸ beeswarm
+    fig, ax = plt.subplots(figsize=(6, 4))
+    plot_grade_beeswarm(pd_hat, df["rating"].values, ax=ax)
+    fig.savefig(plots_dir / "beeswarm.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    # 3 ▸ histogram
+    fig, ax = plt.subplots(figsize=(6, 4))
+    plot_pd_histogram(pd_hat, df["rating"].values, ax=ax)
+    fig.savefig(plots_dir / "pd_histogram.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    # 4 ▸ decision-matrix heat-map
+    fig, ax = plt.subplots(figsize=(4, 4))
+    plot_decision_matrix_heatmap(cfg.decision_matrix, ax=ax)
+    fig.savefig(plots_dir / "decision_matrix.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    # 5 ▸ approval-funnel
+    counts = {
+        "Scored apps"   : len(df),
+        "Model pass (θ)": int((pd_hat < thr).sum()),
+        "Hard decline"  : int((pd_hat >= thr).sum()),
+    }
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_approval_funnel(counts, ax=ax)
+    fig.savefig(plots_dir / "approval_funnel.png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+    # 6 ▸ stress scenarios
+    stress_df = apply_stress_scenarios(
+        pd_hat=pd_hat,
+        ead=df["exposure"].values,
+        ratings=df["rating"].values,
+        threshold=thr,
+        edges=list(cfg.rating_edges),
+    )
+    # save JSON for further analysis
+    stress_df.to_json(plots_dir / "stress_results.json",
+                      orient="records", indent=2)
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    plot_portfolio_pd_bars(stress_df, ax=ax)
+    fig.savefig(plots_dir / "stress_approval_rate.png",
+                dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    
+    audits = [("country_code", "IRN"),
+              ("primary_sector", "fintech")]
+
+    y_pred = (pd_hat < thr).astype(int)
+    bias_log = {}
+    for col, prot in audits:
+        bias_log[f"{col}_{prot}_DI"] = disparate_impact(y_pred, df[col], prot)
+
+        if "target" in df.columns:
+            bias_log[f"{col}_{prot}_EOD"] = equal_opportunity_diff(
+                df["target"].values, y_pred, df[col], prot)
+
+    for k, v in bias_log.items():
+        if (("DI" in k and (v < 0.80 or v > 1.25))
+            or ("EOD" in k and abs(v) > 0.05)):
+            logging.warning("⚠︎ Fair-lending flag on %s : %.3f", k, v)
+
+    logging.info("📊  Plots & stress results → %s", plots_dir)
+
 
 def stress_test_threshold(
         thr: float,
