@@ -72,6 +72,7 @@ except ImportError:
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.base import clone
 import logging
+from scipy.optimize import minimize
 
 
 # --------------------------------------------------------------------------- #
@@ -243,12 +244,8 @@ warnings.filterwarnings(
 
 
 ################################################################################
-# Rating‑edge optimiser (vectorised & deterministic)                            
+# Rating‑edge optimiser                            
 ################################################################################
-
-from scipy.optimize import minimize  # re‑import in case not in scope
-import pandas as pd
-
 
 def optimise_edges(
     y: np.ndarray,
@@ -370,8 +367,9 @@ class DecisionEngine:
         out.update(extra)
         return out
 
-
-# ── drift metrics ───────────────────────────────────────────────────────────
+################################################################################
+# Drift metric
+################################################################################
 
 def psi(expected: NDArray[np.float_], actual: NDArray[np.float_], bins: int = 10) -> float:
     cuts = np.quantile(expected, np.linspace(0, 1, bins + 1))
@@ -380,9 +378,9 @@ def psi(expected: NDArray[np.float_], actual: NDArray[np.float_], bins: int = 10
     e_pct, a_pct = e_cnt / e_cnt.sum(), a_cnt / a_cnt.sum()
     return float(((a_pct - e_pct) * np.log((a_pct + 1e-9) / (e_pct + 1e-9))).sum())
 
-# --------------------------------------------------------------------------- #
+################################################################################
 # Fair-lending metrics
-# --------------------------------------------------------------------------- #
+################################################################################
 
 def disparate_impact(y_pred: np.ndarray,
                      group: pd.Series,
@@ -404,8 +402,10 @@ def equal_opportunity_diff(y_true: np.ndarray,
         return tp / (tp + fn) if (tp + fn) else np.nan
     return _tpr(group == protected_val) - _tpr(group != protected_val)
 
+################################################################################
+#  transformers 
+################################################################################
 
-# ── transformers ────────────────────────────────────────────────────────────
 class WoETransformer(FunctionTransformer):
     def __init__(self, col: str):
         super().__init__(validate=False, feature_names_out="one-to-one")
@@ -499,7 +499,10 @@ class KFoldEBTargetEncoder(FunctionTransformer):
         enc = x.map(self.post_full_).fillna(self.global_)
         return pd.DataFrame({f"eb_{self.col}": enc}, index=X.index)
 
+################################################################################
 # ╭────────────────────────── EB for list‑column ────────────────────────────╮
+################################################################################
+
 class EBListTargetEncoder(FunctionTransformer):
     def __init__(self, col: str = "category_list", target: str = "target", prior: tuple[float, float] = (2.0, 98.0)):
         super().__init__(validate=False, feature_names_out="one-to-one")
@@ -526,8 +529,10 @@ class EBListTargetEncoder(FunctionTransformer):
         out = X[self.col].apply(row_mean)
         return pd.DataFrame({"eb_sector_mean": out}, index=X.index)
 
-
+################################################################################
 # ╭────────────────────── Hierarchical median imputer ───────────────────────╮
+################################################################################
+
 class HierarchicalMedianImputer(FunctionTransformer):
     """Fit medians by geo × sector hierarchy, then impute in cascade order."""
 
@@ -599,7 +604,6 @@ class HierarchicalMedianImputer(FunctionTransformer):
 
 # ───────────────────────────── Utilities (geo) ──────────────────────────────
 _country_2_3 = {c.alpha_2.upper(): c.alpha_3 for c in pycountry.countries}
-_sub_map = {c.alpha_3: getattr(c, "subregion", None) for c in pycountry.countries}
 
 # ─────────────────────── Robust date‑parser helpers ─────────────────────────
 _date_regex = re.compile(r"(\d{1,4}[-/]){2}\d{2,4}")
@@ -933,7 +937,6 @@ def build_monotone_constraints(feature_names: Sequence[str]) -> Tuple[int, ...]:
 ################################################################################
 # Hyper‑parameter optimisation                                                  
 ################################################################################
-
 def _cv_auc(pipe: Pipeline, X: pd.DataFrame, y: np.ndarray, w: np.ndarray) -> float:
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=GLOBAL_SEED)
     try:
