@@ -1,0 +1,22 @@
+# ---------------- core numerical stack ----------------
+numpy>=1.24
+pandas>=2.0
+polars>=0.20
+scipy>=1.10
+scikit-learn>=1.3
+joblib>=1.3
+
+# ---------------- modelling & optimisation ------------ 
+xgboost>=2.0          # optional; RandomForest fallback used if absent
+optuna>=3.5
+optbinning>=0.13
+shap>=0.43
+
+# ---------------- text / fuzzy matching ---------------
+rapidfuzz>=3.6
+
+# ---------------- data & utilities --------------------
+matplotlib>=3.6
+requests>=2.31
+pycountry>=23.12
+countryinfo>=0.1.2
