@@ -1022,7 +1022,7 @@ def tune_hyperparams(
     w: NDArray[np.float_],
     *,
     model_type: str="xgb",
-    n_trials: int = 8,
+    n_trials: int = 50,
 ) -> dict:
     """Return best params (conditional on *model_type*)."""
 
