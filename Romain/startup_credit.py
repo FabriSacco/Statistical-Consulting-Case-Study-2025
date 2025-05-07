@@ -1490,7 +1490,7 @@ def plot_decision_matrix_heatmap(decision_matrix: dict[str, dict[str, dict]],
 
     # build action + colour grid
     action_grid = np.empty((len(ratings), len(expos)), dtype=object)
-    colour_grid = np.empty_like(action_grid, dtype=object)
+    colour_grid = np.zeros((len(ratings), len(expos), 4))
 
     for i, rating in enumerate(ratings):
         for j, band in enumerate(expos):
