@@ -87,7 +87,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-MACRO_DIR = Path(r"C:\Users\Romain\OneDrive - KU Leuven\Masters\MBIS\Year 2\Semester 2\Statistical Consulting\ExternalData") 
+MACRO_DIR = Path(r"Romain\ExternalData") 
 META_FILE = Path(__file__).with_name("country_meta.csv")
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -756,7 +756,7 @@ def _join_macro(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # load WGI
-def _load_regulatory_framework(json_path: Path=r"C:\Users\Romain\OneDrive - KU Leuven\Masters\MBIS\Year 2\Semester 2\Statistical Consulting\regulatory_framework.json") -> pd.DataFrame:
+def _load_regulatory_framework(json_path: Path=r"Romain\regulatory_framework.json") -> pd.DataFrame:
     """Read JSON → DataFrame[iso3 + flattened governance columns]."""
     global GOV_COLS, MACRO_COLS  # capture for later interaction block
 
@@ -1037,11 +1037,11 @@ def tune_hyperparams(
             }
         else:  # RandomForest
             params = {
-                "clf__n_estimators": trial.suggest_int("n_estimators", 300, 1200, step=100),
-                "clf__max_depth": trial.suggest_int("max_depth", 5, 30),
+                "clf__n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
+                "clf__max_depth": trial.suggest_int("max_depth", 3, 20),
                 "clf__min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
-                "clf__min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 10),
-                "clf__max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", None]),
+                "clf__min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 5),
+                "clf__max_features": trial.suggest_categorical("max_features", ["sqrt", "log2"]),
             }
         pipe = pipe_base.set_params(**params)
         return _cv_auc(pipe, X, y, w)
@@ -1140,7 +1140,7 @@ def train(csv: str | Path,
     cfg_path : str or Path or None
         Path to model config file.
     model_type : str
-        One of ["xgb", "lgb", ...] indicating the underlying model.
+        One of ["xgb", "rf"] indicating the underlying model.
     """
 
     # --- load config ----------------------------------------------------
@@ -1175,7 +1175,7 @@ def train(csv: str | Path,
     # --- hyperparameter tuning -----------------------------------------
     base_clf = build_model(len(feat_names), monotone_constraints=mono_vec, model_type=model_type)
     pipe_base = Pipeline([("pre", clone(pre)), ("clf", base_clf)])
-    best_params = tune_hyperparams(pipe_base, X_build, y_build, w_build)
+    best_params = tune_hyperparams(pipe_base, X_build, y_build, w_build, model_type=model_type)
 
     # --- final training -------------------------------------------------
     final_clf = build_model(
@@ -1490,7 +1490,7 @@ def plot_decision_matrix_heatmap(decision_matrix: dict[str, dict[str, dict]],
 
     # build action + colour grid
     action_grid = np.empty((len(ratings), len(expos)), dtype=object)
-    colour_grid = np.zeros((len(ratings), len(expos), 4))
+    colour_grid = np.zeros((len(ratings), len(expos), 4))  # RGBA array
 
     for i, rating in enumerate(ratings):
         for j, band in enumerate(expos):
