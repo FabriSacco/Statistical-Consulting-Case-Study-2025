@@ -1,0 +1,41 @@
+{
+    "USA": {
+        "regulatory_quality": 0.89,
+        "rule_of_law": 0.88,
+        "control_of_corruption": 0.85,
+        "startup_regulation_index": 0.92,
+        "investor_protection": 0.9,
+        "intellectual_property_rights": 0.88,
+        "financial_regulation": {
+            "banking_supervision": 0.9,
+            "securities_regulation": 0.92,
+            "insurance_regulation": 0.88
+        }
+    },
+    "GBR": {
+        "regulatory_quality": 0.87,
+        "rule_of_law": 0.85,
+        "control_of_corruption": 0.87,
+        "startup_regulation_index": 0.89,
+        "investor_protection": 0.88,
+        "intellectual_property_rights": 0.86,
+        "financial_regulation": {
+            "banking_supervision": 0.88,
+            "securities_regulation": 0.9,
+            "insurance_regulation": 0.87
+        }
+    },
+    "DEU": {
+        "regulatory_quality": 0.88,
+        "rule_of_law": 0.89,
+        "control_of_corruption": 0.86,
+        "startup_regulation_index": 0.85,
+        "investor_protection": 0.85,
+        "intellectual_property_rights": 0.87,
+        "financial_regulation": {
+            "banking_supervision": 0.89,
+            "securities_regulation": 0.88,
+            "insurance_regulation": 0.89
+        }
+    }
+}
